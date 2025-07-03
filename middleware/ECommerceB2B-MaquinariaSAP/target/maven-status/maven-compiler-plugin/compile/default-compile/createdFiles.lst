@@ -1,0 +1,11 @@
+com\ecommerce\service\ProductoService.class
+com\ecommerce\odata\MyEdmProvider.class
+com\ecommerce\service\impl\ProductoServiceImpl.class
+com\ecommerce\controller\ProductoController.class
+com\ecommerce\odata\ODataSingleProcessorImpl.class
+com\ecommerce\odata\MyODataServiceFactory.class
+com\ecommerce\controller\HomeController.class
+com\ecommerce\repository\ProductoRepository.class
+com\ecommerce\odata\ODataConfig.class
+com\ecommerce\BasicApplication.class
+com\ecommerce\model\Producto.class
