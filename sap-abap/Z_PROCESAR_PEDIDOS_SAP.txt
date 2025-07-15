@@ -1,0 +1,424 @@
+*&---------------------------------------------------------------------*
+*& Report Z_PROCESAR_PEDIDOS_SAP
+*&---------------------------------------------------------------------*
+*& Descripción: Este programa procesa archivos CSV desde un e-commerce
+*&               para crear Pedidos de Venta en SAP S/4HANA, con o sin
+*&               referencia a una cotización existente.
+*&---------------------------------------------------------------------*
+REPORT Z_PROCESAR_PEDIDOS_SAP.
+
+*---------------------------------------------------------------------*
+* Parámetros
+*---------------------------------------------------------------------*
+PARAMETERS:
+  p_dir    TYPE string     DEFAULT 'C:\SFTP\SAP_IN' OBLIGATORY, " Directorio de entrada
+  p_doctyp TYPE vbak-auart DEFAULT 'OR'              OBLIGATORY. " Tipo de documento de pedido (ej. TA - Pedido estándar)
+
+*---------------------------------------------------------------------*
+* Tipos para el archivo CSV de entrada (Pedido)
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_csv_order,
+         corr_id        TYPE string,       " ID de correlación del e-commerce
+         order_ref      TYPE string,       " OrderReference del e-commerce
+         kunnr          TYPE kunnr,        " Cliente
+         matnr          TYPE matnr,        " Material
+         descrip        TYPE string,       " Descripción (campo en CSV, no usado en BAPI)
+         meins          TYPE meins,        " Unidad de medida
+         vkorg          TYPE vkorg,        " Organización de ventas
+         vtweg          TYPE vtweg,        " Canal de distribución
+         spart          TYPE spart,        " Sector
+         kwmeng         TYPE kwmeng,       " Cantidad de pedido
+         dfrom          TYPE dats,         " Fecha de necesidad (ValInicio)
+         dto            TYPE dats,         " Fecha fin (ValFin)
+         ref_quote      TYPE vbeln_vl,     " Número de la cotización de referencia en SAP
+         plant          TYPE werks_d,      " Centro (ej. MI00)
+         ref_quote_item TYPE bapisditm-itm_number, " Número de posición de la cotización de referencia
+       END OF ty_csv_order.
+
+TYPES: BEGIN OF ty_group_order,
+         kunnr TYPE kunnr,
+         vkorg TYPE vkorg,
+         vtweg TYPE vtweg,
+         spart TYPE spart,
+       END OF ty_group_order.
+
+*---------------------------------------------------------------------*
+* Tipo de estructura fija para el SPLIT del CSV
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_split_fields,
+         field01 TYPE string,
+         field02 TYPE string,
+         field03 TYPE string,
+         field04 TYPE string,
+         field05 TYPE string,
+         field06 TYPE string,
+         field07 TYPE string,
+         field08 TYPE string,
+         field09 TYPE string,
+         field10 TYPE string,
+         field11 TYPE string,
+         field12 TYPE string,
+         field13 TYPE string,
+         field14 TYPE string,
+         field15 TYPE string,
+       END OF ty_split_fields.
+
+*---------------------------------------------------------------------*
+* Variables de control y tablas internas
+*---------------------------------------------------------------------*
+DATA: lt_lines       TYPE TABLE OF string,
+      lt_out         TYPE TABLE OF string,
+      lv_line        TYPE string,
+      lv_corr_id     TYPE string,
+      lv_order_ref   TYPE string, " OrderReference del e-commerce
+      lv_out_file    TYPE string.
+
+DATA: it_csv_orders TYPE TABLE OF ty_csv_order,
+      wa_csv_order  TYPE ty_csv_order,
+      it_groups     TYPE TABLE OF ty_group_order,
+      wa_group      TYPE ty_group_order.
+
+DATA: lv_idx       TYPE i,
+      lv_vbeln     TYPE vbeln,    " Número de documento de pedido generado por SAP
+      lv_status    TYPE string,   " 'OK' o 'ERROR'
+      lv_err_msg   TYPE string.
+
+DATA: ls_split_fields TYPE ty_split_fields. " Variable para el SPLIT directo
+DATA: lv_date_temp    TYPE string.          " Variable temporal para el reemplazo de fechas
+
+*---------------------------------------------------------------------*
+* BAPI / estructuras para BAPI_SALESORDER_CREATEFROMDAT2
+*---------------------------------------------------------------------*
+DATA: ls_head  TYPE bapisdhd1,
+      ls_headx TYPE bapisdhd1x,
+      lt_part  TYPE TABLE OF bapiparnr,
+      wa_part  TYPE bapiparnr,
+      lt_item  TYPE TABLE OF bapisditm,
+      wa_item  TYPE bapisditm,
+      lt_itemx TYPE TABLE OF bapisditmx,
+      wa_itemx TYPE bapisditmx,
+      lt_sch   TYPE TABLE OF bapischdl,
+      wa_sch   TYPE bapischdl,
+      lt_schx  TYPE TABLE OF bapischdlx,
+      wa_schx  TYPE bapischdlx,
+      lt_ret   TYPE TABLE OF bapiret2,
+      wa_ret   TYPE bapiret2.
+
+*---------------------------------------------------------------------*
+* Variables para selección dinámica de archivo
+*---------------------------------------------------------------------*
+DATA: lt_file_tab    TYPE filetable,
+      ls_file_info   TYPE file_info,
+      lv_count       TYPE i,
+      lv_in_file     TYPE string.
+
+*---------------------------------------------------------------------*
+* Variables para mover y renombrar archivos
+*---------------------------------------------------------------------*
+DATA: lv_processed_dir TYPE string VALUE 'C:\SFTP\SAP_IN_PROCESSED',
+      lv_name          TYPE string,
+      lv_ext           TYPE string,
+      lv_timestamp     TYPE string,
+      lv_new_filename  TYPE string,
+      lv_dest_file     TYPE string,
+      lv_delete_rc     TYPE i.
+
+*---------------------------------------------------------------------*
+* Bucle infinito con reintento cada 2 segundos
+*---------------------------------------------------------------------*
+WHILE 1 = 1.
+
+  " 0. Listar archivos que empiecen por PEDIDO_*.CSV
+  CLEAR lt_file_tab.
+  CALL METHOD cl_gui_frontend_services=>directory_list_files
+    EXPORTING
+      directory                = p_dir
+      filter                   = 'PEDIDO_*.CSV'
+      files_only               = abap_true
+      directories_only         = abap_false
+    CHANGING
+      file_table               = lt_file_tab
+      count                    = lv_count
+    EXCEPTIONS
+      cntl_error               = 1
+      directory_list_files_failed = 2
+      wrong_parameter          = 3
+      error_no_gui             = 4
+      not_supported_by_gui     = 5
+      OTHERS                   = 6.
+  IF sy-subrc <> 0 OR lt_file_tab IS INITIAL.
+    WAIT UP TO 2 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  " Elegir el primer archivo encontrado
+  READ TABLE lt_file_tab INDEX 1 INTO ls_file_info.
+  CONCATENATE p_dir '\' ls_file_info-filename INTO lv_in_file.
+
+  " 1. Intentar subir CSV
+  CLEAR lt_lines.
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+    EXPORTING
+      filename = lv_in_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = lt_lines
+    EXCEPTIONS
+      OTHERS   = 5.
+  IF sy-subrc <> 0.
+    MESSAGE |Error al subir archivo { lv_in_file } (RC={ sy-subrc })| TYPE 'E'.
+    WAIT UP TO 2 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  IF lines( lt_lines ) <= 1.
+    MESSAGE |Archivo { lv_in_file } está vacío o solo contiene la cabecera. Reintentando...| TYPE 'W'.
+    WAIT UP TO 2 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  " Mover el archivo original a SAP_IN_PROCESSED
+  CONCATENATE sy-datum sy-uzeit INTO lv_timestamp.
+  SPLIT ls_file_info-filename AT '.' INTO lv_name lv_ext.
+  CONCATENATE lv_name '_' lv_timestamp '.' lv_ext INTO lv_new_filename.
+  CONCATENATE lv_processed_dir '\' lv_new_filename INTO lv_dest_file.
+  CALL METHOD cl_gui_frontend_services=>file_copy
+    EXPORTING
+      source      = lv_in_file
+      destination = lv_dest_file
+      overwrite   = abap_true
+    EXCEPTIONS
+      OTHERS      = 13.
+  IF sy-subrc = 0.
+    CALL METHOD cl_gui_frontend_services=>file_delete
+      EXPORTING
+        filename = lv_in_file
+      CHANGING
+        rc       = lv_delete_rc
+      EXCEPTIONS
+        OTHERS   = 9.
+  ELSE.
+    MESSAGE |Error al mover { lv_in_file } a { lv_dest_file } (RC={ sy-subrc })| TYPE 'E'.
+    WAIT UP TO 2 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  " Inicializar tablas internas para nuevo archivo
+  REFRESH: it_csv_orders, it_groups.
+  CLEAR: lv_corr_id, lv_order_ref.
+
+  " 2. Parsear CSV
+  LOOP AT lt_lines INTO lv_line.
+    IF sy-tabix = 1 OR lv_line IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR: ls_split_fields, wa_csv_order.
+    SPLIT lv_line AT ';' INTO
+      ls_split_fields-field01 ls_split_fields-field02 ls_split_fields-field03
+      ls_split_fields-field04 ls_split_fields-field05 ls_split_fields-field06
+      ls_split_fields-field07 ls_split_fields-field08 ls_split_fields-field09
+      ls_split_fields-field10 ls_split_fields-field11 ls_split_fields-field12
+      ls_split_fields-field13 ls_split_fields-field14 ls_split_fields-field15.
+
+    wa_csv_order-corr_id   = ls_split_fields-field01.
+    wa_csv_order-order_ref = ls_split_fields-field02.
+    wa_csv_order-kunnr     = ls_split_fields-field03.
+    wa_csv_order-matnr     = ls_split_fields-field04.
+    wa_csv_order-descrip   = ls_split_fields-field05.
+    wa_csv_order-meins     = ls_split_fields-field06.
+    wa_csv_order-vkorg     = ls_split_fields-field07.
+    wa_csv_order-vtweg     = ls_split_fields-field08.
+    wa_csv_order-spart     = ls_split_fields-field09.
+    wa_csv_order-kwmeng    = ls_split_fields-field10.
+
+    lv_date_temp = ls_split_fields-field11.
+    REPLACE ALL OCCURRENCES OF '-' IN lv_date_temp WITH ''.
+    wa_csv_order-dfrom = lv_date_temp.
+
+    lv_date_temp = ls_split_fields-field12.
+    REPLACE ALL OCCURRENCES OF '-' IN lv_date_temp WITH ''.
+    wa_csv_order-dto = lv_date_temp.
+
+    wa_csv_order-ref_quote      = ls_split_fields-field13.
+    wa_csv_order-plant          = ls_split_fields-field14.
+    wa_csv_order-ref_quote_item = ls_split_fields-field15.
+
+    "---> CORRECCIÓN CLAVE: Se elimina el CONDENSE para el material, pero se mantiene para los otros campos.
+    CONDENSE: wa_csv_order-kunnr NO-GAPS, wa_csv_order-ref_quote NO-GAPS, wa_csv_order-ref_quote_item NO-GAPS.
+
+    " La conversión ALPHA es importante para los campos numéricos como cliente, material (si es numérico), etc.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_csv_order-kunnr IMPORTING output = wa_csv_order-kunnr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_csv_order-matnr IMPORTING output = wa_csv_order-matnr.
+    IF wa_csv_order-ref_quote IS NOT INITIAL.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_csv_order-ref_quote IMPORTING output = wa_csv_order-ref_quote.
+    ENDIF.
+    IF wa_csv_order-ref_quote_item IS NOT INITIAL.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_csv_order-ref_quote_item IMPORTING output = wa_csv_order-ref_quote_item.
+    ENDIF.
+
+    IF wa_csv_order-corr_id IS INITIAL OR wa_csv_order-kunnr IS INITIAL OR
+       wa_csv_order-matnr IS INITIAL OR wa_csv_order-kwmeng IS INITIAL.
+      MESSAGE |Error: Campos obligatorios vacíos para CorrelationId: { wa_csv_order-corr_id }| TYPE 'E'.
+      CONTINUE.
+    ENDIF.
+
+    IF wa_csv_order-spart IS INITIAL. wa_csv_order-spart = 'BI'. ENDIF.
+    IF wa_csv_order-plant IS INITIAL. wa_csv_order-plant = 'MI00'. ENDIF.
+
+    APPEND wa_csv_order TO it_csv_orders.
+  ENDLOOP.
+
+  IF it_csv_orders IS INITIAL.
+    MESSAGE |No se encontraron datos válidos en el archivo CSV para procesar.| TYPE 'W'.
+    WAIT UP TO 2 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  LOOP AT it_csv_orders INTO wa_csv_order.
+    MOVE-CORRESPONDING wa_csv_order TO wa_group.
+    COLLECT wa_group INTO it_groups.
+  ENDLOOP.
+
+  CLEAR lt_out.
+  APPEND 'CorrelationId;SapOrderId;Status;ErrorMessage' TO lt_out.
+
+  LOOP AT it_groups INTO wa_group.
+    CLEAR: ls_head, ls_headx, lt_part, lt_item, lt_itemx, lt_sch, lt_schx, lt_ret.
+    CLEAR: lv_status, lv_vbeln, lv_err_msg.
+    lv_idx = 0.
+
+    READ TABLE it_csv_orders INTO wa_csv_order WITH KEY kunnr = wa_group-kunnr
+                                                     vkorg = wa_group-vkorg
+                                                     vtweg = wa_group-vtweg
+                                                     spart = wa_group-spart.
+    IF sy-subrc = 0.
+      lv_corr_id = wa_csv_order-corr_id.
+    ENDIF.
+
+    ls_head-doc_type   = p_doctyp.
+    ls_head-sales_org  = wa_group-vkorg.
+    ls_head-distr_chan = wa_group-vtweg.
+    ls_head-division   = wa_group-spart.
+
+    ls_headx-doc_type   = 'X'.
+    ls_headx-sales_org  = 'X'.
+    ls_headx-distr_chan = 'X'.
+    ls_headx-division   = 'X'.
+
+    CLEAR wa_part.
+    wa_part-partn_role = 'AG'.
+    wa_part-partn_numb = wa_group-kunnr.
+    APPEND wa_part TO lt_part.
+
+    CLEAR wa_part.
+    wa_part-partn_role = 'WE'.
+    wa_part-partn_numb = wa_group-kunnr.
+    APPEND wa_part TO lt_part.
+
+    LOOP AT it_csv_orders INTO wa_csv_order
+        WHERE kunnr = wa_group-kunnr
+          AND vkorg = wa_group-vkorg
+          AND vtweg = wa_group-vtweg
+          AND spart = wa_group-spart.
+
+      lv_idx = lv_idx + 1.
+      wa_item-itm_number = lv_idx * 10.
+
+      wa_item-material   = wa_csv_order-matnr.
+      wa_item-plant      = wa_csv_order-plant.
+      wa_item-target_qty = wa_csv_order-kwmeng.
+      wa_item-target_qu  = wa_csv_order-meins.
+
+      IF wa_csv_order-ref_quote IS NOT INITIAL.
+        wa_item-ref_doc    = wa_csv_order-ref_quote.
+        wa_item-ref_doc_it = wa_csv_order-ref_quote_item.
+        wa_item-ref_doc_ca = 'B'.
+      ENDIF.
+      APPEND wa_item TO lt_item.
+
+      CLEAR wa_itemx.
+      wa_itemx-itm_number = wa_item-itm_number.
+      wa_itemx-material   = 'X'.
+      wa_itemx-plant      = 'X'.
+      wa_itemx-target_qty = 'X'.
+      wa_itemx-target_qu  = 'X'.
+      IF wa_csv_order-ref_quote IS NOT INITIAL.
+        wa_itemx-ref_doc    = 'X'.
+        wa_itemx-ref_doc_it = 'X'.
+        wa_itemx-ref_doc_ca = 'X'.
+      ENDIF.
+      APPEND wa_itemx TO lt_itemx.
+
+      CLEAR: wa_sch, wa_schx.
+      wa_sch-itm_number  = wa_item-itm_number.
+      wa_sch-sched_line  = '0001'.
+      wa_sch-req_qty     = wa_csv_order-kwmeng.
+      wa_sch-req_date    = wa_csv_order-dfrom.
+      APPEND wa_sch TO lt_sch.
+
+      wa_schx-itm_number = wa_item-itm_number.
+      wa_schx-sched_line = '0001'.
+      wa_schx-req_qty    = 'X'.
+      wa_schx-req_date   = 'X'.
+      APPEND wa_schx TO lt_schx.
+
+    ENDLOOP.
+
+    IF lt_item IS INITIAL.
+      lv_status = 'ERROR'.
+      lv_err_msg = 'Ningún ítem válido fue procesado. No se pudo crear el pedido.'.
+    ELSE.
+      CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+        EXPORTING
+          order_header_in     = ls_head
+          order_header_inx    = ls_headx
+        IMPORTING
+          salesdocument       = lv_vbeln
+        TABLES
+          return              = lt_ret
+          order_partners      = lt_part
+          order_items_in      = lt_item
+          order_items_inx     = lt_itemx
+          order_schedules_in  = lt_sch
+          order_schedules_inx = lt_schx.
+
+      LOOP AT lt_ret INTO wa_ret WHERE type = 'E' OR type = 'A'.
+        lv_status = 'ERROR'.
+        CONCATENATE lv_err_msg wa_ret-message INTO lv_err_msg SEPARATED BY ' / '.
+      ENDLOOP.
+
+      IF lv_status = 'ERROR'.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        SHIFT lv_err_msg LEFT DELETING LEADING ' / '.
+      ELSE.
+        READ TABLE lt_ret WITH KEY type = 'S' TRANSPORTING NO FIELDS.
+        IF sy-subrc = 0.
+           lv_status = 'OK'.
+           lv_err_msg = |Procesado Exitosamente. Pedido SAP:{ lv_vbeln }|.
+           CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
+        ELSE.
+           lv_status = 'ERROR'.
+           lv_err_msg = 'BAPI no retornó mensaje de éxito ni de error explícito.'.
+           CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    CONCATENATE lv_corr_id lv_vbeln lv_status lv_err_msg INTO lv_line SEPARATED BY ';'.
+    APPEND lv_line TO lt_out.
+  ENDLOOP.
+
+  " 6. Descargar CSV de respuestas
+  CONCATENATE 'C:\SFTP\SAP_OUT\PEDIDO_RESP_' sy-datum sy-uzeit '.csv' INTO lv_out_file.
+  CALL METHOD cl_gui_frontend_services=>gui_download
+    EXPORTING
+      filename = lv_out_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = lt_out.
+
+  MESSAGE |CSV de respuesta del pedido generado en { lv_out_file }| TYPE 'S'.
+
+  WAIT UP TO 2 SECONDS.
+ENDWHILE.

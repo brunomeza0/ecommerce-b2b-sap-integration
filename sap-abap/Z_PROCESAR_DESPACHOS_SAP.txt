@@ -1,0 +1,330 @@
+REPORT Z_PROCESAR_DESPACHOS_SAP.
+
+*---------------------------------------------------------------------*
+* PARÁMETROS Y CONSTANTES
+*---------------------------------------------------------------------*
+PARAMETERS:
+  p_dir  TYPE string DEFAULT 'C:\SFTP\SAP_IN'   OBLIGATORY,
+  p_out  TYPE string DEFAULT 'C:\SFTP\SAP_OUT'  OBLIGATORY.
+
+CONSTANTS: lc_processed_dir TYPE string VALUE 'C:\SFTP\SAP_IN_PROCESSED'.
+
+*---------------------------------------------------------------------*
+* TIPOS
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_csv,
+         order     TYPE string, ship_pt   TYPE string, ship_date TYPE string,
+         name1     TYPE string, street    TYPE string, postal    TYPE string,
+         city      TYPE string, country   TYPE string, line      TYPE string,
+         so_item   TYPE string,
+         material  TYPE string, qty       TYPE string, plant     TYPE string,
+         sloc      TYPE lgort_d,
+       END OF ty_csv.
+
+*---------------------------------------------------------------------*
+* DATOS
+*---------------------------------------------------------------------*
+DATA: lv_in_file     TYPE string,
+      lv_out_file    TYPE string,
+      lt_lines       TYPE TABLE OF string,
+      lt_out         TYPE TABLE OF string.
+
+* Datos para procesamiento de archivos
+DATA: lt_file_tab    TYPE filetable,
+      ls_file_info   TYPE file_info,
+      lv_count       TYPE i,
+      lv_delete_rc   TYPE i.
+
+*---------------------------------------------------------------------*
+* BUCLE PRINCIPAL
+*---------------------------------------------------------------------*
+WHILE 1 = 1.
+
+  " 1. BUSCAR ARCHIVO DE ENTRADA
+  CLEAR: lt_file_tab, ls_file_info.
+  CALL METHOD cl_gui_frontend_services=>directory_list_files
+    EXPORTING
+      directory  = p_dir
+      filter     = 'DESPACHO_*.CSV'
+      files_only = abap_true
+    CHANGING
+      file_table = lt_file_tab
+      count      = lv_count
+    EXCEPTIONS
+      OTHERS     = 1.
+  IF sy-subrc <> 0 OR lt_file_tab IS INITIAL.
+    WAIT UP TO 5 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  READ TABLE lt_file_tab INDEX 1 INTO ls_file_info.
+  CONCATENATE p_dir '\' ls_file_info-filename INTO lv_in_file.
+
+  " 2. LEER CONTENIDO DEL ARCHIVO
+  CLEAR lt_lines.
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+    EXPORTING
+      filename = lv_in_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = lt_lines
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    DATA: lv_err_msg  TYPE string,
+          lv_sy_subrc TYPE string.
+    lv_sy_subrc = sy-subrc.
+    CLEAR lt_out.
+    APPEND 'Order;Delivery;MaterialDoc;Type;Message' TO lt_out.
+    CONCATENATE ';;;E;Error irrecuperable al leer el archivo ' lv_in_file '. SY-SUBRC: ' lv_sy_subrc
+      INTO lv_err_msg.
+    APPEND lv_err_msg TO lt_out.
+    CONCATENATE p_out '\' 'ERROR_LECTURA_' sy-datum sy-uzeit '.csv' INTO lv_out_file.
+    CALL METHOD cl_gui_frontend_services=>gui_download
+      EXPORTING filename = lv_out_file
+      CHANGING  data_tab = lt_out.
+    WAIT UP TO 5 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  " 3. MOVER ARCHIVO A PROCESADOS
+  DATA: lv_timestamp TYPE string,
+        lv_name      TYPE string,
+        lv_ext       TYPE string,
+        lv_new_fname TYPE string,
+        lv_dest_file TYPE string.
+  CONCATENATE sy-datum sy-uzeit INTO lv_timestamp.
+  SPLIT ls_file_info-filename AT '.' INTO lv_name lv_ext.
+  CONCATENATE lv_name '_' lv_timestamp '.' lv_ext INTO lv_new_fname.
+  CONCATENATE lc_processed_dir '\' lv_new_fname INTO lv_dest_file.
+  CALL METHOD cl_gui_frontend_services=>file_copy
+    EXPORTING source = lv_in_file destination = lv_dest_file overwrite = abap_true
+    EXCEPTIONS OTHERS = 1.
+  IF sy-subrc = 0.
+    CALL METHOD cl_gui_frontend_services=>file_delete
+      EXPORTING
+        filename = lv_in_file
+      CHANGING
+        rc       = lv_delete_rc
+      EXCEPTIONS
+        OTHERS   = 1.
+  ENDIF.
+
+  "====================================================================
+  " INICIO DEL BLOQUE DE PROCESAMIENTO
+  "====================================================================
+  DATA: lt_in_csv      TYPE TABLE OF ty_csv,
+        wa_in_csv      TYPE ty_csv,
+        lt_fields      TYPE TABLE OF string,
+        lv_line        TYPE string,
+        lo_exc         TYPE REF TO cx_root,
+        lv_exc_text    TYPE string.
+
+  DATA: lv_out_status  TYPE char1 VALUE 'E',
+        lv_out_msg     TYPE string,
+        lv_order_id    TYPE string VALUE 'N/A',
+        lv_delivery_id TYPE vbeln_vl,
+        lv_matdoc_id   TYPE mblnr.
+
+  CLEAR: lt_out.
+  APPEND 'Order;Delivery;MaterialDoc;Type;Message' TO lt_out.
+
+  TRY.
+      " 4. PARSEAR CSV Y APLICAR LÓGICA DE NEGOCIO
+      LOOP AT lt_lines INTO lv_line.
+        IF sy-tabix = 1. CONTINUE. ENDIF.
+        IF lv_line IS INITIAL. CONTINUE. ENDIF.
+        SPLIT lv_line AT ';' INTO TABLE lt_fields.
+        IF lines( lt_fields ) = 12.
+          APPEND '' TO lt_fields.
+        ELSEIF lines( lt_fields ) <> 13.
+          CONTINUE.
+        ENDIF.
+
+        CLEAR wa_in_csv.
+        READ TABLE lt_fields INDEX 1  INTO wa_in_csv-order.
+        READ TABLE lt_fields INDEX 2  INTO wa_in_csv-ship_pt.
+        READ TABLE lt_fields INDEX 3  INTO wa_in_csv-ship_date.
+        READ TABLE lt_fields INDEX 9  INTO wa_in_csv-line.
+        " --- ASEGÚRATE DE QUE ESTAS LÍNEAS ESTÉN ASÍ ---
+        READ TABLE lt_fields INDEX 10 INTO wa_in_csv-material.
+        READ TABLE lt_fields INDEX 11 INTO wa_in_csv-qty.
+        READ TABLE lt_fields INDEX 12 INTO wa_in_csv-plant.
+        READ TABLE lt_fields INDEX 13 INTO wa_in_csv-sloc.
+
+        " --- AJUSTE IMPORTANTE AQUÍ ---
+        wa_in_csv-so_item = wa_in_csv-line. " Guarda la línea original (ej: '1')
+
+        DATA lv_line_num TYPE i.
+        lv_line_num = wa_in_csv-line.
+        lv_line_num = lv_line_num * 10.
+        wa_in_csv-line = lv_line_num. " Ahora wa_in_csv-line contiene la pos. de entrega (ej: '10')
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_in_csv-order   IMPORTING output = wa_in_csv-order.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_in_csv-line    IMPORTING output = wa_in_csv-line.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT' EXPORTING input = wa_in_csv-so_item IMPORTING output = wa_in_csv-so_item. " <-- Aplica conversión también a la nueva posición
+        APPEND wa_in_csv TO lt_in_csv.
+      ENDLOOP.
+
+      IF lt_in_csv IS INITIAL.
+        lv_out_msg = 'Error de Formato: Ninguna línea de datos cumplió con el formato requerido.'.
+        RAISE EXCEPTION TYPE cx_sy_no_handler.
+      ENDIF.
+
+      READ TABLE lt_in_csv INDEX 1 INTO wa_in_csv.
+      lv_order_id = wa_in_csv-order.
+
+      " 5. PREPARAR DATOS PARA BAPIS
+      DATA: lt_items_ref    TYPE TABLE OF bapidlvreftosalesorder,
+            wa_item_ref     TYPE bapidlvreftosalesorder,
+            lt_return       TYPE TABLE OF bapiret2,
+            wa_ret          TYPE bapiret2,
+            lv_due_date     TYPE dats,
+            lv_ship_point   TYPE vstel.
+
+      lv_due_date   = wa_in_csv-ship_date.
+      lv_ship_point = wa_in_csv-ship_pt.
+
+      LOOP AT lt_in_csv INTO wa_in_csv.
+        CLEAR wa_item_ref.
+        wa_item_ref-ref_doc    = wa_in_csv-order.
+        wa_item_ref-ref_item   = wa_in_csv-line.
+        wa_item_ref-dlv_qty    = wa_in_csv-qty.
+        wa_item_ref-sales_unit = 'EA'.
+        APPEND wa_item_ref TO lt_items_ref.
+      ENDLOOP.
+
+      " 6. CREAR ENTREGA (Paso 1)
+      CALL FUNCTION 'BAPI_OUTB_DELIVERY_CREATE_SLS'
+        EXPORTING
+          ship_point        = lv_ship_point
+
+        IMPORTING
+          delivery          = lv_delivery_id
+        TABLES
+          sales_order_items = lt_items_ref
+          return            = lt_return.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
+
+      LOOP AT lt_return INTO wa_ret WHERE type = 'E' OR type = 'A'.
+        CONCATENATE lv_out_msg wa_ret-message INTO lv_out_msg SEPARATED BY ' / '.
+      ENDLOOP.
+      IF lv_out_msg IS NOT INITIAL.
+        lv_order_id = wa_in_csv-order.
+        RAISE EXCEPTION TYPE cx_sy_no_handler.
+      ENDIF.
+      IF lv_delivery_id IS INITIAL.
+        lv_out_msg = 'BAPI de creación no devolvió error, pero tampoco creó la entrega.'.
+        RAISE EXCEPTION TYPE cx_sy_no_handler.
+      ENDIF.
+*--------------------------------------------------------------------*
+* 6.1  (MODIFICADO) Asignar Almacén (LGORT) ANTES de la confirmación  *
+* NOTA: La cantidad de picking ya NO se actualiza aquí.         *
+*--------------------------------------------------------------------*
+"--- declaraciones locales ------------------------------------------
+DATA: ls_hdr_data_chg    TYPE bapiobdlvhdrchg,
+      ls_hdr_ctrl_chg    TYPE bapiobdlvhdrctrlchg,
+      lt_new_item_org    TYPE TABLE OF bapiobdlvitemorg,
+      ls_new_item_org    LIKE LINE OF lt_new_item_org,
+      lt_return_chg      TYPE TABLE OF bapiret2,
+      wa_return_chg      TYPE bapiret2.
+
+"--- cabecera obligatoria -------------------------------------------
+ls_hdr_data_chg-deliv_numb = lv_delivery_id.
+ls_hdr_ctrl_chg-deliv_numb = lv_delivery_id.
+
+"--- recorrer líneas del CSV SOLO para asignar LGORT ----------------
+LOOP AT lt_in_csv INTO wa_in_csv.
+  "→ NEW_ITEM_ORG  (LGORT) -----------------------
+  CLEAR ls_new_item_org.
+  ls_new_item_org-deliv_numb = lv_delivery_id.
+  ls_new_item_org-itm_number = wa_in_csv-line.
+  ls_new_item_org-stge_loc   = COND lgort_d(
+                                 WHEN wa_in_csv-sloc IS INITIAL
+                                 THEN 'TG00'
+                                 ELSE wa_in_csv-sloc ).
+  APPEND ls_new_item_org TO lt_new_item_org.
+ENDLOOP.
+
+"--- Si no hay nada que cambiar, saltamos la llamada a la BAPI ---
+IF lt_new_item_org IS INITIAL.
+  " No hacer nada
+ELSE.
+  "--- llamar al BAPI solo para cambiar el almacén --------------
+  CALL FUNCTION 'BAPI_OUTB_DELIVERY_CHANGE'
+    EXPORTING
+      delivery       = lv_delivery_id
+      header_data    = ls_hdr_data_chg
+      header_control = ls_hdr_ctrl_chg
+    TABLES
+      new_item_org   = lt_new_item_org     " ÚNICO PROPÓSITO: Asignar LGORT
+      return         = lt_return_chg.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
+
+  "--- gestión de errores --------------------------------------------
+  CLEAR lv_out_msg.
+  LOOP AT lt_return_chg INTO wa_return_chg WHERE type = 'E' OR type = 'A'.
+      CONCATENATE lv_out_msg '[Change LGORT] ' wa_return_chg-message
+             INTO lv_out_msg SEPARATED BY ' / '.
+  ENDLOOP.
+
+  IF lv_out_msg IS NOT INITIAL.
+    RAISE EXCEPTION TYPE cx_sy_no_handler.
+  ENDIF.
+ENDIF.
+
+*--------------------------------------------------------------------*
+* FIN BLOQUE 6.1 MODIFICADO                                          *
+*--------------------------------------------------------------------*
+
+
+
+      " 8. OBTENER DOCUMENTO DE MATERIAL
+      SELECT SINGLE k~mblnr INTO lv_matdoc_id
+        FROM mkpf AS k INNER JOIN mseg AS s ON k~mblnr = s~mblnr AND k~mjahr = s~mjahr
+        WHERE s~lfbnr = lv_delivery_id AND s~bwart = '601'.
+
+      lv_out_status = 'S'.
+      lv_out_msg = 'Despacho completado correctamente'.
+
+    CATCH cx_root INTO lo_exc.
+      IF lv_out_msg IS INITIAL.
+        lv_exc_text = lo_exc->get_text( ).
+        lv_out_msg = lv_exc_text.
+      ENDIF.
+      SHIFT lv_out_msg LEFT DELETING LEADING ' / '.
+  ENDTRY.
+
+  " 9. ESCRITURA INCONDICIONAL DEL ARCHIVO DE SALIDA
+  DATA lv_final_line TYPE string.
+  CONCATENATE lv_order_id lv_delivery_id lv_matdoc_id lv_out_status lv_out_msg
+    INTO lv_final_line SEPARATED BY ';'.
+  APPEND lv_final_line TO lt_out.
+
+  IF lv_order_id = 'N/A'.
+    CONCATENATE p_out '\DESPACHO_RESP_ERROR_' sy-datum '_' sy-uzeit '.csv' INTO lv_out_file.
+  ELSE.
+    CONCATENATE p_out '\' lv_order_id '_dispatch_result.csv' INTO lv_out_file.
+  ENDIF.
+
+  CALL METHOD cl_gui_frontend_services=>gui_download
+    EXPORTING
+      filename = lv_out_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = lt_out
+    EXCEPTIONS
+      OTHERS   = 1.
+
+  DATA lv_status_msg TYPE string.
+  IF sy-subrc = 0.
+    CONCATENATE 'Archivo de respuesta generado: ' lv_out_file INTO lv_status_msg.
+    MESSAGE lv_status_msg TYPE 'S'.
+  ELSE.
+    MESSAGE 'Error CRÍTICO al intentar escribir el archivo de respuesta en SAP_OUT.' TYPE 'E'.
+  ENDIF.
+
+  WAIT UP TO 5 SECONDS.
+
+ENDWHILE.

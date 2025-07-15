@@ -1,0 +1,470 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_EXPORTAR_ASINCRONO
+*&---------------------------------------------------------------------*
+REPORT z_exportar_asincrono.
+
+*---------------------------------------------------------------------*
+* Parámetros para los archivos de clientes y productos
+*---------------------------------------------------------------------*
+PARAMETERS p_fcli  TYPE string DEFAULT 'C:\sftp\sap_out\clientes.csv'.   " Archivo clientes
+PARAMETERS p_fprod TYPE string DEFAULT 'C:\sftp\sap_out\productos.csv'.  " Archivo productos
+
+*---------------------------------------------------------------------*
+* Filtros para SD y planta
+*---------------------------------------------------------------------*
+DATA: lv_vkorg TYPE vkorg      VALUE 'UE00',   " Organización de ventas O100
+      lv_vtweg TYPE vtweg      VALUE 'WH'.     " Canal de distribución 10
+
+*---------------------------------------------------------------------*
+* Tipos y tablas internas para clientes
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_customer,
+         kunnr  TYPE kunnr,     " Cliente
+         name1  TYPE name1,     " Razón social
+         stras  TYPE stras,     " Dirección
+         ort01  TYPE ort01,     " Ciudad
+         regio  TYPE regio,     " Región / Estado
+         pstlz  TYPE pstlz,     " Código postal
+         land1  TYPE land1,     " País
+         werks  TYPE werks_d,   " Centro
+         vkorg  TYPE vkorg,     " Org. de ventas
+         vtweg  TYPE vtweg,     " Canal de distribución
+         spart  TYPE spart,     " División
+         waers  TYPE waers,     " Moneda
+         kdgrp  TYPE kdgrp,     " Grupo de precios
+         zterm  TYPE dzterm,    " Condiciones de pago
+       END OF ty_customer.
+
+DATA: lt_customers   TYPE TABLE OF ty_customer,
+      ls_customer    TYPE ty_customer,
+      lt_lines_cust  TYPE TABLE OF string,
+      lv_header_cust TYPE string,
+      lv_line_cust   TYPE string,
+      lv_count_cust  TYPE i.
+
+*---------------------------------------------------------------------*
+* Tipos y tablas internas para productos
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_prod,
+         product_id     TYPE mara-matnr,   " MARA–MATNR
+         product_desc   TYPE makt-maktx,   " MAKT–MAKTX
+         base_uom       TYPE mara-meins,     " MARA–MEINS
+         sales_org      TYPE mvke-vkorg,     " MVKE–VKORG
+         distr_chan     TYPE mvke-vtweg,     " MVKE–VTWEG
+         material_group TYPE mara-matkl,   " MARA–MATKL
+         plant          TYPE marc-werks,     " MARC–WERKS
+         del_ind        TYPE marc-lvorm,     " MARC–LVORM
+         price          TYPE mbew-stprs,     " MBEW–STPRS
+         stock          TYPE mard-labst,     " Stock total disponible
+       END OF ty_prod.
+
+DATA: it_prods       TYPE TABLE OF ty_prod,
+      ls_prod        TYPE ty_prod,
+      lt_lines_prod  TYPE TABLE OF string,
+      lv_header_prod TYPE string,
+      lv_line_prod   TYPE string,
+      lv_cnt_prod    TYPE i.
+
+*---------------------------------------------------------------------*
+* Tipos y tablas internas para cliente–material básico
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_cli_mat,
+         kunnr TYPE kunnr,          " Cliente
+         matnr TYPE mara-matnr,       " Material
+         price TYPE konp-kbetr,       " Precio base PR00
+         waers TYPE konp-konwa,       " Moneda del precio
+         disc  TYPE konp-kbetr,       " Descuento K005
+       END OF ty_cli_mat.
+
+DATA: lt_cli_mat    TYPE SORTED TABLE OF ty_cli_mat WITH UNIQUE KEY kunnr matnr,
+      ls_cli_mat    TYPE ty_cli_mat,
+      lt_lines_cli  TYPE TABLE OF string,
+      lv_header_cli TYPE string,
+      lv_line_cli   TYPE string,
+      lv_cnt_cli    TYPE i.
+
+FIELD-SYMBOLS <ls_cli> TYPE ty_cli_mat.  "Para READ y LOOP con casting
+
+CONSTANTS c_file_cli_mat TYPE string VALUE 'C:\sftp\sap_out\cliente_material.csv'.
+
+DATA: lx_error  TYPE REF TO cx_root,
+      lx_error2 TYPE REF TO cx_root.
+
+*---------------------------------------------------------------------*
+* Nuevos tipos y tablas internas para EXPORTAR CLIENTE_MATERIAL.csv
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_material,
+         matnr TYPE mara-matnr,
+         maktx TYPE makt-maktx,
+         stprs TYPE mbew-stprs,
+         stock TYPE mard-labst,
+       END OF ty_material.
+
+TYPES: BEGIN OF ty_condition,
+         kunnr TYPE kna1-kunnr,
+         matnr TYPE mara-matnr,
+         kbetr TYPE konp-kbetr,
+         kpein TYPE konp-kpein,
+       END OF ty_condition.
+
+TYPES: BEGIN OF ty_material_discount,
+         matnr TYPE mara-matnr,
+         kbetr TYPE konp-kbetr,
+         kpein TYPE konp-kpein,
+       END OF ty_material_discount.
+
+TYPES: BEGIN OF ty_cust_discount,
+         kunnr TYPE kna1-kunnr,
+         kbetr TYPE konp-kbetr,
+         kpein TYPE konp-kpein,
+       END OF ty_cust_discount.
+
+TYPES: BEGIN OF ty_output,
+         kunnr           TYPE kna1-kunnr,
+         name1           TYPE kna1-name1,
+         matnr           TYPE mara-matnr,
+         maktx           TYPE makt-maktx,
+         price           TYPE mbew-stprs,
+         descuento_k004  TYPE konp-kbetr,
+         udescuento_k004 TYPE konp-kpein,
+         descuento_k005  TYPE konp-kbetr,
+         udescuento_k005 TYPE konp-kpein,
+         descuento_k007  TYPE konp-kbetr,
+         udescuento_k007 TYPE konp-kpein,
+       END OF ty_output.
+
+DATA: lt_materials TYPE STANDARD TABLE OF ty_material        WITH EMPTY KEY,
+      lt_conds     TYPE STANDARD TABLE OF ty_condition         WITH EMPTY KEY,
+      lt_ra_spec   TYPE STANDARD TABLE OF ty_condition         WITH EMPTY KEY,
+      lt_ra_gen    TYPE STANDARD TABLE OF ty_material_discount WITH EMPTY KEY,
+      lt_ra_cust   TYPE STANDARD TABLE OF ty_cust_discount     WITH EMPTY KEY,
+      lt_output    TYPE STANDARD TABLE OF ty_output            WITH EMPTY KEY,
+      lt_csv       TYPE STANDARD TABLE OF string               WITH EMPTY KEY.
+
+DATA: lv_path TYPE string VALUE 'C:\sftp\sap_out\CLIENTE_MATERIAL.csv',
+      lv_line TYPE string.
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+  WHILE 1 = 1.
+
+    "==================== EXPORTAR CLIENTES ==========================="
+    REFRESH lt_customers.
+    REFRESH lt_lines_cust.
+    CLEAR: ls_customer, lv_header_cust, lv_line_cust, lv_count_cust.
+
+    " --- Se mantiene el filtro para el grupo de clientes '07' ---
+    SELECT a~kunnr, a~name1, a~stras, a~ort01, a~regio, a~pstlz, a~land1,
+           a~werks, b~vkorg, b~vtweg, b~spart, b~waers, b~kdgrp, b~zterm
+      INTO CORRESPONDING FIELDS OF TABLE @lt_customers
+      FROM kna1 AS a
+      INNER JOIN knvv AS b ON a~kunnr = b~kunnr
+      WHERE b~vkorg = @lv_vkorg
+        AND b~vtweg = @lv_vtweg
+        AND b~kdgrp = '07'. " <-- FILTRO CLAVE: Grupo de clientes (precios)
+
+    IF lt_customers IS INITIAL.
+      WRITE: / 'No hay clientes que cumplan los filtros:',
+             / '  Org. Ventas =', lv_vkorg,
+             / '  Canal         =', lv_vtweg,
+             / '  Grupo Cliente =', '07'.
+    ELSE.
+      lv_header_cust = |Cliente;RazónSocial;Dirección;Ciudad;Región;CP;País;Centro;OrgVenta;Canal;División;Moneda;GrpPrecio;CondPago|.
+      APPEND lv_header_cust TO lt_lines_cust.
+      LOOP AT lt_customers INTO ls_customer.
+        lv_line_cust = |{ ls_customer-kunnr }| && ';'
+                     && |{ ls_customer-name1 }| && ';'
+                     && |{ ls_customer-stras }| && ';'
+                     && |{ ls_customer-ort01 }| && ';'
+                     && |{ ls_customer-regio }| && ';'
+                     && |{ ls_customer-pstlz }| && ';'
+                     && |{ ls_customer-land1 }| && ';'
+                     && |{ ls_customer-werks }| && ';'
+                     && |{ ls_customer-vkorg }| && ';'
+                     && |{ ls_customer-vtweg }| && ';'
+                     && |{ ls_customer-spart }| && ';'
+                     && |{ ls_customer-waers }| && ';'
+                     && |{ ls_customer-kdgrp }| && ';'
+                     && |{ ls_customer-zterm }|.
+        APPEND lv_line_cust TO lt_lines_cust.
+      ENDLOOP.
+      lv_count_cust = lines( lt_lines_cust ) - 1.
+      TRY.
+          cl_gui_frontend_services=>gui_download(
+            EXPORTING filename = p_fcli
+                      filetype = 'ASC'
+            CHANGING  data_tab = lt_lines_cust ).
+          WRITE: / |Archivo generado: { p_fcli } (Registros: { lv_count_cust })|.
+        CATCH cx_root INTO lx_error.
+          WRITE: / |ERROR al exportar: { lx_error->get_text( ) }|.
+      ENDTRY.
+    ENDIF.
+
+    "=================== EXPORTAR PRODUCTOS ============================"
+    REFRESH it_prods.
+    REFRESH lt_lines_prod.
+    CLEAR: ls_prod, lv_header_prod, lv_line_prod, lv_cnt_prod.
+
+    "=== 1) Selección de datos básicos de materiales + stock ==="
+    SELECT
+        a~matnr           AS product_id,
+        makt~maktx        AS product_desc,
+        a~meins           AS base_uom,
+        b~vkorg           AS sales_org,
+        b~vtweg           AS distr_chan,
+        a~matkl           AS material_group,
+        c~werks           AS plant,
+        c~lvorm           AS del_ind,
+        d~stprs           AS price,
+        SUM( mard~labst ) AS stock
+      INTO TABLE @it_prods
+      FROM mara   AS a
+      INNER JOIN makt   AS makt ON makt~matnr = a~matnr
+                                AND makt~spras = @sy-langu
+      INNER JOIN mvke   AS b    ON b~matnr = a~matnr
+                                AND b~vkorg = @lv_vkorg
+                                AND b~vtweg = @lv_vtweg
+      INNER JOIN marc   AS c    ON c~matnr = a~matnr
+      LEFT OUTER JOIN mbew   AS d    ON d~matnr = a~matnr
+                                     AND d~bwkey = c~werks
+      LEFT OUTER JOIN mard   AS mard ON mard~matnr = a~matnr
+                                     AND mard~werks = c~werks
+      " --- MODIFICADO: Se añade el filtro para la planta 'MI00' ---
+      WHERE a~matkl IN ('GRU', 'EXC', 'ACC')
+        AND c~werks = 'MI00' " <-- FILTRO AÑADIDO: Centro / Planta
+      GROUP BY
+        a~matnr,
+        makt~maktx,
+        a~meins,
+        b~vkorg,
+        b~vtweg,
+        a~matkl,
+        c~werks,
+        c~lvorm,
+        d~stprs.
+
+    IF it_prods IS INITIAL.
+      WRITE: / 'No se encontraron materiales para cotización con:',
+             / '  Org. Ventas =', lv_vkorg,
+             / '  Canal         =', lv_vtweg,
+             / '  Grupos Mat.   =', 'GRU, EXC, ACC',
+             / '  Centro/Planta =', 'MI00'. " <-- Mensaje de log actualizado
+    ELSE.
+      "=== 2) Construir encabezado del CSV con columna adicional 'Stock' ==="
+      lv_header_prod = |ProductoID;Descripción;UM;OrgVentas;Canal;Grupo;Centro;BorradoPlanta;Precio;Stock|.
+      APPEND lv_header_prod TO lt_lines_prod.
+
+      LOOP AT it_prods INTO ls_prod.
+        lv_line_prod =
+              |{ ls_prod-product_id }|     && ';'
+           && |{ ls_prod-product_desc }|   && ';'
+           && |{ ls_prod-base_uom }|       && ';'
+           && |{ ls_prod-sales_org }|      && ';'
+           && |{ ls_prod-distr_chan }|     && ';'
+           && |{ ls_prod-material_group }| && ';'
+           && |{ ls_prod-plant }|          && ';'
+           && |{ ls_prod-del_ind }|        && ';'
+           && |{ ls_prod-price }|          && ';'
+           && |{ ls_prod-stock }|.
+        APPEND lv_line_prod TO lt_lines_prod.
+      ENDLOOP.
+
+      lv_cnt_prod = lines( lt_lines_prod ) - 1.
+      TRY.
+          cl_gui_frontend_services=>gui_download(
+            EXPORTING filename = p_fprod
+                      filetype = 'ASC'
+            CHANGING  data_tab = lt_lines_prod ).
+          WRITE: / |Archivo generado: { p_fprod } (Registros: { lv_cnt_prod })|.
+        CATCH cx_root INTO lx_error.
+          WRITE: / |ERROR al exportar: { lx_error->get_text( ) }|.
+      ENDTRY.
+    ENDIF.
+
+    "============ EXPORTAR CLIENTE_MATERIAL (PR00/K004/K005/K007) ========"
+    REFRESH lt_materials.
+    REFRESH lt_conds.
+    REFRESH lt_ra_spec.
+    REFRESH lt_ra_gen.
+    REFRESH lt_ra_cust.
+    REFRESH lt_output.
+    REFRESH lt_csv.
+    CLEAR lv_line.
+
+    IF lt_customers IS INITIAL OR it_prods IS INITIAL.
+      WRITE: / |No hay clientes o productos válidos para generar el fichero CLIENTE_MATERIAL.|.
+    ELSE.
+      " 1) Reutilizar la lista de materiales ya filtrada de 'it_prods'.
+      LOOP AT it_prods INTO DATA(ls_product_data).
+        APPEND VALUE #( matnr = ls_product_data-product_id
+                        maktx = ls_product_data-product_desc
+                        stprs = ls_product_data-price
+                        stock = ls_product_data-stock ) TO lt_materials.
+      ENDLOOP.
+
+      IF lt_materials IS INITIAL.
+        WRITE: / |Error inesperado: La lista de materiales está vacía después de la conversión.|.
+      ELSE.
+        " 2) Precios PR00 específicos (cliente+material)
+        SELECT a~kunnr,
+               a~matnr,
+               p~kbetr,
+               p~kpein
+          INTO TABLE @lt_conds
+          FROM a305 AS a
+          INNER JOIN konp AS p ON p~knumh = a~knumh
+                               AND p~kschl = 'PR00'
+          WHERE a~kappl = 'V'
+            AND a~vkorg = @lv_vkorg
+            AND a~vtweg = @lv_vtweg
+            AND a~datab <= @sy-datum
+            AND a~datbi >= @sy-datum.
+        SORT lt_conds BY kunnr matnr.
+
+        " 3) Descuentos K005 (cliente+material)
+        SELECT a~kunnr,
+               a~matnr,
+               p~kbetr,
+               p~kpein
+          INTO TABLE @lt_ra_spec
+          FROM a305 AS a
+          INNER JOIN konp AS p ON p~knumh = a~knumh
+                               AND p~kschl = 'K005'
+          WHERE a~kappl = 'V'
+            AND a~vkorg = @lv_vkorg
+            AND a~vtweg = @lv_vtweg
+            AND a~datab <= @sy-datum
+            AND a~datbi >= @sy-datum.
+        SORT lt_ra_spec BY kunnr matnr.
+
+        " 4) Descuentos K004 (por material)
+        SELECT a~matnr,
+               p~kbetr,
+               p~kpein
+          INTO TABLE @lt_ra_gen
+          FROM a304 AS a
+          INNER JOIN konp AS p ON p~knumh = a~knumh
+                               AND p~kschl = 'K004'
+          WHERE a~kappl = 'V'
+            AND a~vkorg = @lv_vkorg
+            AND a~vtweg = @lv_vtweg
+            AND a~datab <= @sy-datum
+            AND a~datbi >= @sy-datum.
+        SORT lt_ra_gen BY matnr.
+
+        " 5) Descuentos K007 (por cliente)
+        SELECT a~kunnr,
+               p~kbetr,
+               p~kpein
+          INTO TABLE @lt_ra_cust
+          FROM a307 AS a
+          INNER JOIN konp AS p ON p~knumh = a~knumh
+                               AND p~kschl = 'K007'
+          WHERE a~kappl = 'V'
+            AND a~vkorg = @lv_vkorg
+            AND a~vtweg = @lv_vtweg
+            AND a~datab <= @sy-datum
+            AND a~datbi >= @sy-datum.
+        SORT lt_ra_cust BY kunnr.
+
+        " 6) Cruce y cálculo
+        LOOP AT lt_customers INTO ls_customer.
+          LOOP AT lt_materials INTO DATA(ls_mat).
+            DATA(ls_out) = VALUE ty_output(
+              kunnr           = ls_customer-kunnr
+              name1           = ls_customer-name1
+              matnr           = ls_mat-matnr
+              maktx           = ls_mat-maktx
+              price           = ls_mat-stprs
+              descuento_k004  = 0
+              udescuento_k004 = 0
+              descuento_k005  = 0
+              udescuento_k005 = 0
+              descuento_k007  = 0
+              udescuento_k007 = 0 ).
+
+            " Aplicar precio específico PR00
+            READ TABLE lt_conds INTO DATA(ls_pr)
+                WITH KEY kunnr = ls_customer-kunnr
+                         matnr = ls_mat-matnr
+                BINARY SEARCH.
+            IF sy-subrc = 0.
+              ls_out-price = COND #( WHEN ls_pr-kpein > 0
+                                     THEN ls_pr-kbetr / ls_pr-kpein
+                                     ELSE ls_pr-kbetr ).
+            ENDIF.
+
+            " Aplicar descuento K004
+            READ TABLE lt_ra_gen INTO DATA(ls_ra_gen_row)
+                WITH KEY matnr = ls_mat-matnr
+                BINARY SEARCH.
+            IF sy-subrc = 0.
+              ls_out-descuento_k004  = COND #( WHEN ls_ra_gen_row-kpein > 0
+                                              THEN ls_ra_gen_row-kbetr / ls_ra_gen_row-kpein
+                                              ELSE ls_ra_gen_row-kbetr ).
+              ls_out-udescuento_k004 = ls_ra_gen_row-kpein.
+            ENDIF.
+
+            " Aplicar descuento K005
+            READ TABLE lt_ra_spec INTO DATA(ls_ra_spec_row)
+                WITH KEY kunnr = ls_customer-kunnr
+                         matnr = ls_mat-matnr
+                BINARY SEARCH.
+            IF sy-subrc = 0.
+              ls_out-descuento_k005  = COND #( WHEN ls_ra_spec_row-kpein > 0
+                                              THEN ls_ra_spec_row-kbetr / ls_ra_spec_row-kpein
+                                              ELSE ls_ra_spec_row-kbetr ).
+              ls_out-udescuento_k005 = ls_ra_spec_row-kpein.
+            ENDIF.
+
+            " Aplicar descuento K007
+            READ TABLE lt_ra_cust INTO DATA(ls_ra_cust_row)
+                WITH KEY kunnr = ls_customer-kunnr
+                BINARY SEARCH.
+            IF sy-subrc = 0.
+              ls_out-descuento_k007  = COND #( WHEN ls_ra_cust_row-kpein > 0
+                                              THEN ls_ra_cust_row-kbetr / ls_ra_cust_row-kpein
+                                              ELSE ls_ra_cust_row-kbetr ).
+              ls_out-udescuento_k007 = ls_ra_cust_row-kpein.
+            ENDIF.
+
+            APPEND ls_out TO lt_output.
+          ENDLOOP.
+        ENDLOOP.
+
+        " 7) Preparar CSV
+        CLEAR lt_csv.
+        APPEND 'Cliente;Nombre Cliente;Material;Descripción;Precio;Desc_K004;UDesc_K004;Desc_K005;UDesc_K005;Desc_K007;UDesc_K007' TO lt_csv.
+        LOOP AT lt_output INTO DATA(ls_row).
+          lv_line = |{ ls_row-kunnr }| && ';'
+                  && |{ ls_row-name1 }|  && ';'
+                  && |{ ls_row-matnr }|  && ';'
+                  && |{ ls_row-maktx }|  && ';'
+                  && |{ ls_row-price  DECIMALS = 2 }| && ';'
+                  && |{ ls_row-descuento_k004  DECIMALS = 2 }| && ';'
+                  && |{ ls_row-udescuento_k004 }| && ';'
+                  && |{ ls_row-descuento_k005  DECIMALS = 2 }| && ';'
+                  && |{ ls_row-udescuento_k005 }| && ';'
+                  && |{ ls_row-descuento_k007  DECIMALS = 2 }| && ';'
+                  && |{ ls_row-udescuento_k007 }|.
+          APPEND lv_line TO lt_csv.
+        ENDLOOP.
+
+        " 8) Descargar CSV
+        TRY.
+            cl_gui_frontend_services=>gui_download(
+              EXPORTING filename = lv_path
+                        filetype = 'ASC'
+              CHANGING  data_tab = lt_csv ).
+            WRITE: / |CSV generado en: { lv_path }|.
+          CATCH cx_root INTO DATA(lx_err).
+            WRITE: / |ERROR al exportar CLIENTE_MATERIAL: { lx_err->get_text( ) }|.
+        ENDTRY.
+      ENDIF.
+    ENDIF.
+
+    "================== PAUSA ANTES DE REPETIR ========================="
+    WAIT UP TO 60 SECONDS.
+  ENDWHILE.

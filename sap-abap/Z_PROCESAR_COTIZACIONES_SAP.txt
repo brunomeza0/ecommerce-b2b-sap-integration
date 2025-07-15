@@ -1,0 +1,722 @@
+*&---------------------------------------------------------------------*
+
+*& Report  Z_PROCESAR_COTIZACIONES_SAP – Versión con reintento silencioso
+
+*&---------------------------------------------------------------------*
+
+REPORT Z_PROCESAR_COTIZACIONES_SAP.
+
+
+
+*---------------------------------------------------------------------*
+
+* Parámetros
+
+*---------------------------------------------------------------------*
+
+PARAMETERS:
+
+  p_dir     TYPE string     DEFAULT 'C:\SFTP\SAP_IN'  OBLIGATORY,  " Directorio de entrada
+
+  p_doctyp  TYPE vbak-auart DEFAULT 'QT'               OBLIGATORY.  " Tipo de documento
+
+
+
+*---------------------------------------------------------------------*
+
+* Tipos
+
+*---------------------------------------------------------------------*
+
+TYPES: BEGIN OF ty_csv,
+
+         kunnr   TYPE kunnr,
+
+         matnr   TYPE matnr,
+
+         meins   TYPE meins,
+
+         vkorg   TYPE vkorg,
+
+         vtweg   TYPE vtweg,
+
+         spart   TYPE spart,
+
+         kwmeng  TYPE kwmeng,
+
+         dfrom   TYPE dats,
+
+         dto     TYPE dats,
+
+       END OF ty_csv.
+
+
+
+TYPES: BEGIN OF ty_group,
+
+         kunnr TYPE kunnr,
+
+         vkorg TYPE vkorg,
+
+         vtweg TYPE vtweg,
+
+         spart TYPE spart,
+
+       END OF ty_group.
+
+
+
+*---------------------------------------------------------------------*
+
+* Variables de control y tablas
+
+*---------------------------------------------------------------------*
+
+DATA: lt_lines     TYPE TABLE OF string,
+
+      lt_fields    TYPE TABLE OF string,
+
+      lt_out       TYPE TABLE OF string,
+
+      lv_line      TYPE string,
+
+      lv_corr_id   TYPE string,
+
+      lv_quote_id  TYPE string,
+
+      lv_out_file  TYPE string.
+
+
+
+DATA: it_csv       TYPE TABLE OF ty_csv,
+
+      wa_csv       TYPE ty_csv,
+
+      it_groups    TYPE TABLE OF ty_group,
+
+      wa_group     TYPE ty_group.
+
+
+
+DATA: lv_idx       TYPE i,
+
+      lv_inq       TYPE vbeln,
+
+      lv_status    TYPE string,    " 'OK' o 'ERROR'
+      lv_err_msg  TYPE string.
+
+
+
+*---------------------------------------------------------------------*
+
+* BAPI / estructuras
+
+*---------------------------------------------------------------------*
+
+DATA: ls_head   TYPE bapisdhd1,
+
+      ls_headx  TYPE bapisdhd1x,
+
+      lt_part   TYPE TABLE OF bapiparnr,
+
+      wa_part   TYPE bapiparnr,
+
+      lt_item   TYPE TABLE OF bapisditm,
+
+      wa_item   TYPE bapisditm,
+
+      lt_itemx  TYPE TABLE OF bapisditmx,
+
+      wa_itemx  TYPE bapisditmx,
+
+      lt_sch    TYPE TABLE OF bapischdl,
+
+      wa_sch    TYPE bapischdl,
+
+      lt_schx   TYPE TABLE OF bapischdlx,
+
+      wa_schx   TYPE bapischdlx,
+
+      lt_ret    TYPE TABLE OF bapiret2,
+
+      wa_ret    TYPE bapiret2.
+
+
+
+*---------------------------------------------------------------------*
+
+* Variables para selección dinámica de archivo
+
+*---------------------------------------------------------------------*
+
+DATA: lt_file_tab     TYPE filetable,
+
+      ls_file_info    TYPE file_info,
+
+      lv_count        TYPE i,
+
+      lv_in_file      TYPE string.
+
+
+
+*---------------------------------------------------------------------*
+
+* Variables para mover y renombrar archivos
+
+*---------------------------------------------------------------------*
+
+DATA: lv_processed_dir TYPE string VALUE 'C:\SFTP\SAP_IN_PROCESSED',
+
+      lv_name          TYPE string,
+
+      lv_ext           TYPE string,
+
+      lv_date_str      TYPE string,
+
+      lv_timestamp     TYPE string,
+
+      lv_new_filename  TYPE string,
+
+      lv_dest_file     TYPE string,
+
+      lv_delete_rc     TYPE i.
+
+
+
+*---------------------------------------------------------------------*
+
+* Bucle infinito con reintento cada 2 segundos
+
+*---------------------------------------------------------------------*
+
+WHILE 1 = 1.
+
+
+
+  " 0. Listar archivos que empiecen por COTIZACION_*.CSV
+
+  CLEAR lt_file_tab.
+
+  CALL METHOD cl_gui_frontend_services=>directory_list_files
+
+    EXPORTING
+
+      directory        = p_dir
+
+      filter           = 'COTIZACION_*.CSV'
+
+      files_only       = abap_true
+
+      directories_only = abap_false
+
+    CHANGING
+
+      file_table       = lt_file_tab
+
+      count            = lv_count
+
+    EXCEPTIONS
+
+      cntl_error                  = 1
+
+      directory_list_files_failed = 2
+
+      wrong_parameter             = 3
+
+      error_no_gui                = 4
+
+      not_supported_by_gui        = 5
+
+      OTHERS                      = 6.
+
+  IF sy-subrc <> 0 OR lt_file_tab IS INITIAL.
+
+    " No hay archivo disponible aún
+
+    WAIT UP TO 2 SECONDS.
+
+    CONTINUE.
+
+  ENDIF.
+
+
+
+  " Elegir el primer archivo encontrado
+
+  READ TABLE lt_file_tab INDEX 1 INTO ls_file_info.
+
+  CONCATENATE p_dir '\' ls_file_info-filename INTO lv_in_file.
+
+
+
+  " 1. Intentar subir CSV; si falla o no existe, reintentar
+
+  CLEAR lt_lines.
+
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+
+    EXPORTING
+
+      filename = lv_in_file
+
+      filetype = 'ASC'
+
+    CHANGING
+
+      data_tab = lt_lines
+
+    EXCEPTIONS
+
+      file_open_error    = 1
+
+      file_read_error    = 2
+
+      invalid_type       = 3
+
+      no_authority       = 4
+
+      others             = 5.
+
+  IF sy-subrc <> 0.
+
+    WAIT UP TO 2 SECONDS.
+
+    CONTINUE.
+
+  ENDIF.
+
+
+
+  " Si no hay contenido (sólo cabecera o vacío), reintentar
+
+  IF lt_lines IS INITIAL.
+
+    WAIT UP TO 2 SECONDS.
+
+    CONTINUE.
+
+  ENDIF.
+
+
+
+  " +++ 1.2 Mover el archivo original a SAP_IN_PROCESSED con timestamp +++
+
+  " Construir fecha en formato DDMMYYYYHHMMSS
+
+  lv_date_str = sy-datum+6(2) && sy-datum+4(2) && sy-datum+0(4).
+
+  lv_timestamp = lv_date_str && sy-uzeit.
+
+
+
+  " Nombre base y extensión
+
+  SPLIT ls_file_info-filename AT '.' INTO lv_name lv_ext.
+
+  CONCATENATE lv_name '_' lv_timestamp '.' lv_ext INTO lv_new_filename.
+
+
+
+  " Ruta destino completa
+
+  CONCATENATE lv_processed_dir '\' lv_new_filename INTO lv_dest_file.
+
+
+
+  " Copiar archivo
+
+  CALL METHOD cl_gui_frontend_services=>file_copy
+
+    EXPORTING
+
+      source      = lv_in_file
+
+      destination = lv_dest_file
+
+      overwrite   = abap_true
+
+    EXCEPTIONS
+
+      cntl_error         = 1
+
+      error_no_gui       = 2
+
+      wrong_parameter    = 3
+
+      disk_full          = 4
+
+      access_denied      = 5
+
+      file_not_found     = 6
+
+      destination_exists = 7
+
+      unknown_error      = 8
+
+      path_not_found     = 9
+
+      disk_write_protect = 10
+
+      drive_not_ready    = 11
+
+      not_supported_by_gui = 12
+
+      OTHERS             = 13.
+
+  IF sy-subrc = 0.
+
+    " Borrar original tras copia
+
+    CALL METHOD cl_gui_frontend_services=>file_delete
+
+      EXPORTING
+
+        filename = lv_in_file
+
+      CHANGING
+
+        rc       = lv_delete_rc
+
+      EXCEPTIONS
+
+        file_delete_failed    = 1
+
+        cntl_error            = 2
+
+        error_no_gui          = 3
+
+        file_not_found        = 4
+
+        access_denied         = 5
+
+        unknown_error         = 6
+
+        not_supported_by_gui  = 7
+
+        wrong_parameter       = 8
+
+        OTHERS                = 9.
+
+  ELSE.
+
+    MESSAGE |Error al mover { lv_in_file } a { lv_dest_file }| TYPE 'E'.
+
+    WAIT UP TO 2 SECONDS.
+
+    CONTINUE.
+
+  ENDIF.
+
+  " +++ Fin del bloque de movimiento +++
+
+
+
+  " Inicializar tablas internas para nuevo archivo
+
+  REFRESH it_csv.
+
+  REFRESH it_groups.
+
+  CLEAR: lv_corr_id, lv_quote_id.
+
+
+
+  " 2. Parsear CSV (omitir la línea de cabecera)
+
+  LOOP AT lt_lines INTO lv_line.
+
+    IF lv_line CS 'CorrelationId'. CONTINUE. ENDIF.
+
+    SPLIT lv_line AT ';' INTO TABLE lt_fields.
+
+    IF lines( lt_fields ) < 12. CONTINUE. ENDIF.
+
+
+
+    CLEAR wa_csv.
+
+    READ TABLE lt_fields INDEX 1 INTO lv_corr_id.
+
+    READ TABLE lt_fields INDEX 2 INTO lv_quote_id.
+
+    READ TABLE lt_fields INDEX 3 INTO wa_csv-kunnr.
+
+    READ TABLE lt_fields INDEX 4 INTO wa_csv-matnr.
+
+    " Índice 5 = Descripción (omitido)
+
+    READ TABLE lt_fields INDEX 6  INTO wa_csv-meins.
+
+    READ TABLE lt_fields INDEX 7  INTO wa_csv-vkorg.
+
+    READ TABLE lt_fields INDEX 8  INTO wa_csv-vtweg.
+
+    READ TABLE lt_fields INDEX 9  INTO wa_csv-spart.
+
+    READ TABLE lt_fields INDEX 10 INTO wa_csv-kwmeng.
+
+    READ TABLE lt_fields INDEX 11 INTO wa_csv-dfrom.
+
+    READ TABLE lt_fields INDEX 12 INTO wa_csv-dto.
+
+
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+
+      EXPORTING input  = wa_csv-kunnr
+
+      IMPORTING output = wa_csv-kunnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+
+      EXPORTING input  = wa_csv-matnr
+
+      IMPORTING output = wa_csv-matnr.
+
+
+
+   IF wa_csv-spart IS INITIAL OR wa_csv-spart <> 'BI'.
+
+   wa_csv-spart = 'BI'.
+
+   ENDIF.
+
+
+
+    APPEND wa_csv TO it_csv.
+
+  ENDLOOP.
+
+
+
+  IF it_csv IS INITIAL.
+
+    WAIT UP TO 2 SECONDS.
+
+    CONTINUE.
+
+  ENDIF.
+
+
+
+  " 3. Agrupar por cliente/organización/…
+
+  LOOP AT it_csv INTO wa_csv.
+
+    MOVE-CORRESPONDING wa_csv TO wa_group.
+
+    COLLECT wa_group INTO it_groups.
+
+  ENDLOOP.
+
+
+
+  " 4. Preparar cabecera del CSV de salida
+
+  CLEAR lt_out.
+
+  APPEND 'CorrelationId;SapQuoteId;Status;ErrorMessage' TO lt_out.
+
+
+
+  " 5. Procesar cada grupo y crear cotización
+
+  LOOP AT it_groups INTO wa_group.
+
+    CLEAR: ls_head, ls_headx, lt_part, lt_item, lt_itemx, lt_sch, lt_schx, lt_ret.
+
+    CLEAR lv_status.
+
+    lv_idx = 0.
+
+
+
+    " Cabecera BAPI
+
+    ls_head-doc_type   = p_doctyp.
+
+    ls_head-sales_org  = wa_group-vkorg.
+
+    ls_head-distr_chan = wa_group-vtweg.
+
+    ls_head-division   = wa_group-spart.
+
+
+
+    ls_headx-doc_type   = 'X'.
+
+    ls_headx-sales_org  = 'X'.
+
+    ls_headx-distr_chan = 'X'.
+
+    ls_headx-division   = 'X'.
+
+
+
+    " Partners
+
+    wa_part-partn_role = 'AG'. wa_part-partn_numb = wa_group-kunnr.
+
+    APPEND wa_part TO lt_part.
+
+    wa_part-partn_role = 'WE'. APPEND wa_part TO lt_part.
+
+
+
+    " Items y schedules
+
+    LOOP AT it_csv INTO wa_csv
+
+         WHERE kunnr = wa_group-kunnr
+
+           AND vkorg = wa_group-vkorg
+
+           AND vtweg = wa_group-vtweg
+
+           AND spart = wa_group-spart.
+
+      lv_idx = lv_idx + 1.
+
+      wa_item-itm_number = lv_idx * 10.
+
+      wa_item-material   = wa_csv-matnr.
+      wa_item-plant      = 'MI00'.
+
+      wa_item-target_qty = wa_csv-kwmeng.
+
+      wa_item-target_qu  = wa_csv-meins.
+
+      APPEND wa_item TO lt_item.
+
+
+
+      wa_itemx-itm_number = 'X'.
+
+      wa_itemx-material   = 'X'.
+
+      wa_itemx-plant      = 'X'.
+
+      wa_itemx-target_qty = 'X'.
+
+      wa_itemx-target_qu  = 'X'.
+
+      APPEND wa_itemx TO lt_itemx.
+
+
+
+      wa_sch-itm_number  = lv_idx * 10.
+
+      wa_sch-sched_line  = '0001'.
+
+      wa_sch-req_qty     = wa_csv-kwmeng.
+
+      wa_sch-req_date    = wa_csv-dfrom.
+
+      APPEND wa_sch TO lt_sch.
+
+
+
+      wa_schx-itm_number = 'X'.
+
+      wa_schx-sched_line = 'X'.
+
+      wa_schx-req_qty    = 'X'.
+
+      wa_schx-req_date   = 'X'.
+
+      APPEND wa_schx TO lt_schx.
+
+    ENDLOOP.
+
+
+
+    " Llamada al BAPI
+
+    CALL FUNCTION 'BAPI_QUOTATION_CREATEFROMDATA2'
+
+      EXPORTING
+
+        quotation_header_in  = ls_head
+
+        quotation_header_inx = ls_headx
+
+      IMPORTING
+
+        salesdocument        = lv_inq
+
+      TABLES
+
+        quotation_partners      = lt_part
+
+        quotation_items_in      = lt_item
+
+        quotation_items_inx     = lt_itemx
+
+        quotation_schedules_in  = lt_sch
+
+        quotation_schedules_inx = lt_schx
+
+        return                  = lt_ret.
+
+
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+
+      EXPORTING wait = 'X'.
+
+
+
+    " Determinar estado
+
+    CLEAR: lv_status, lv_err_msg.
+    LOOP AT lt_ret INTO wa_ret WHERE type = 'E' OR type = 'A'.
+      lv_status = 'ERROR'.
+      " Concatenar los mensajes de error para tener un log completo
+      CONCATENATE lv_err_msg wa_ret-message INTO lv_err_msg SEPARATED BY ' / '.
+    ENDLOOP.
+
+    IF lv_status IS INITIAL.
+      lv_status = 'OK'.
+      lv_err_msg = 'Procesado Exitosamente'.
+    ELSE.
+      " Limpiar espacios iniciales del primer separador
+      SHIFT lv_err_msg LEFT DELETING LEADING ' / '.
+    ENDIF.
+
+    " Se añade el mensaje de error a la línea de salida
+    CONCATENATE lv_corr_id lv_inq lv_status lv_err_msg INTO lv_line SEPARATED BY ';'.
+    APPEND lv_line TO lt_out.
+
+  ENDLOOP.
+
+
+
+  " 6. Descargar CSV de respuestas
+
+  CONCATENATE 'C:\SFTP\SAP_OUT\COTIZACION_RESP_' lv_corr_id '.csv'
+
+              INTO lv_out_file.
+
+  CALL METHOD cl_gui_frontend_services=>gui_download
+
+    EXPORTING
+
+      filename = lv_out_file
+
+      filetype = 'ASC'
+
+    CHANGING
+
+      data_tab = lt_out.
+
+
+
+  MESSAGE |CSV generado en { lv_out_file }| TYPE 'S'.
+
+
+
+  " Esperar 2 segundos antes de repetir
+
+  WAIT UP TO 2 SECONDS.
+
+ENDWHILE.

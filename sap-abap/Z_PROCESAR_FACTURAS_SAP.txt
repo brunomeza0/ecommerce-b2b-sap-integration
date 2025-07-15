@@ -1,0 +1,209 @@
+REPORT z_procesar_facturas_sap.
+
+*---------------------------------------------------------------------*
+* PARÁMETROS Y CONSTANTES (RUTAS LOCALES DEL PC)
+*---------------------------------------------------------------------*
+PARAMETERS:
+  p_dir  TYPE string DEFAULT 'C:\SFTP\SAP_IN'  OBLIGATORY,
+  p_out  TYPE string DEFAULT 'C:\SFTP\SAP_OUT' OBLIGATORY.
+
+CONSTANTS:
+  lc_processed_dir TYPE string VALUE 'C:\SFTP\SAP_IN_PROCESSED'.
+
+*---------------------------------------------------------------------*
+* TIPOS
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_csv,
+         order    TYPE vbeln_vl,
+         delivery TYPE vbeln_vl,
+         invoice  TYPE dats,
+       END OF ty_csv.
+
+*---------------------------------------------------------------------*
+* DATOS GLOBALES
+*---------------------------------------------------------------------*
+DATA: lv_in_file     TYPE string,
+      lv_out_file    TYPE string,
+      lt_lines       TYPE TABLE OF string,
+      lt_out         TYPE TABLE OF string.
+
+DATA: lt_file_tab    TYPE filetable,
+      ls_file_info   TYPE file_info,
+      lv_count       TYPE i,
+      lv_delete_rc   TYPE i.
+
+" Variables de procesamiento
+DATA: lt_in_csv      TYPE TABLE OF ty_csv,
+      wa_in_csv      TYPE ty_csv,
+      lt_fields      TYPE TABLE OF string,
+      lv_line        TYPE string,
+      lo_exc         TYPE REF TO cx_root,
+      lv_exc_text    TYPE string.
+
+DATA: lv_out_status  TYPE char1,
+      lv_out_msg     TYPE string,
+      lv_order_id    TYPE vbeln_vl,
+      lv_invoice_id  TYPE vbeln_vl,
+      lv_delivery    TYPE vbeln_vl,
+      lv_bill_date   TYPE dats.
+
+*---------------------------------------------------------------------*
+* BUCLE PRINCIPAL
+*---------------------------------------------------------------------*
+WHILE 1 = 1.
+
+  " 1) Listar archivos locales FACTURA_*.CSV
+  CLEAR: lt_file_tab, ls_file_info.
+  CALL METHOD cl_gui_frontend_services=>directory_list_files
+    EXPORTING
+      directory    = p_dir
+      filter       = 'FACTURA_*.CSV'
+      files_only   = abap_true
+    CHANGING
+      file_table   = lt_file_tab
+      count        = lv_count
+    EXCEPTIONS
+      OTHERS       = 1.
+
+  IF sy-subrc <> 0 OR lt_file_tab IS INITIAL.
+    WAIT UP TO 10 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  READ TABLE lt_file_tab INDEX 1 INTO ls_file_info.
+  CONCATENATE p_dir '\' ls_file_info-filename INTO lv_in_file.
+
+  " 2) Subir líneas desde el PC
+  CLEAR lt_lines.
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+    EXPORTING
+      filename = lv_in_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = lt_lines
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    WAIT UP TO 10 SECONDS.
+    CONTINUE.
+  ENDIF.
+
+  "====================================================================
+  " INICIO DEL BLOQUE DE PROCESAMIENTO
+  "====================================================================
+  CLEAR: lt_in_csv, lt_out, lv_out_msg, lv_invoice_id.
+  lv_out_status = 'E'.
+  lv_order_id = 'N/A'.
+  APPEND 'Order;Invoice;Type;Message' TO lt_out.
+
+  TRY.
+      LOOP AT lt_lines INTO lv_line.
+          IF sy-tabix = 1 OR lv_line IS INITIAL. CONTINUE. ENDIF.
+          SPLIT lv_line AT ';' INTO TABLE lt_fields.
+          IF lines( lt_fields ) <> 3. CONTINUE. ENDIF.
+          CLEAR wa_in_csv.
+          READ TABLE lt_fields INDEX 1 INTO wa_in_csv-order.
+          READ TABLE lt_fields INDEX 2 INTO wa_in_csv-delivery.
+          READ TABLE lt_fields INDEX 3 INTO wa_in_csv-invoice.
+          APPEND wa_in_csv TO lt_in_csv.
+      ENDLOOP.
+
+      IF lt_in_csv IS INITIAL.
+          lv_out_msg = 'Formato inválido o archivo no contiene datos procesables.'.
+      ELSE.
+          READ TABLE lt_in_csv INDEX 1 INTO wa_in_csv.
+          lv_order_id  = wa_in_csv-order.
+          lv_delivery  = wa_in_csv-delivery.
+          lv_bill_date = wa_in_csv-invoice.
+
+          DATA: lt_return_pgi TYPE TABLE OF bapiret2.
+          CALL FUNCTION 'BAPI_OUTB_DELIVERY_CONFIRM_DEC'
+            EXPORTING
+              delivery       = lv_delivery
+              header_data    = VALUE bapiobdlvhdrcon( deliv_numb = lv_delivery )
+              header_control = VALUE bapiobdlvhdrctrlcon( deliv_numb = lv_delivery )
+            TABLES
+              return         = lt_return_pgi.
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
+
+          LOOP AT lt_return_pgi INTO DATA(wa_pgi) WHERE type = 'E' OR type = 'A'.
+              IF lv_out_msg IS INITIAL. lv_out_msg = wa_pgi-message.
+              ELSE. CONCATENATE lv_out_msg wa_pgi-message INTO lv_out_msg SEPARATED BY ' / '. ENDIF.
+          ENDLOOP.
+
+          IF lv_out_msg IS INITIAL.
+              DATA: lt_billingdatain TYPE TABLE OF bapivbrk,
+                    lt_return        TYPE TABLE OF bapiret2,
+                    lt_success       TYPE TABLE OF bapivbrksuccess.
+
+              " >> CORREGIDO: Se reemplaza la sintaxis moderna por la clásica usando una work area.
+              DATA: wa_billingdatain TYPE bapivbrk. " 1. Declarar work area
+              wa_billingdatain-ref_doc    = lv_delivery. " 2. Llenar campos
+              wa_billingdatain-ref_doc_ca = 'J'.
+              wa_billingdatain-bill_date  = lv_bill_date.
+              APPEND wa_billingdatain TO lt_billingdatain. " 3. Añadir a la tabla
+
+              CALL FUNCTION 'BAPI_BILLINGDOC_CREATEMULTIPLE'
+                TABLES
+                  billingdatain = lt_billingdatain
+                  return        = lt_return
+                  success       = lt_success.
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
+
+              IF lt_success IS NOT INITIAL.
+                  READ TABLE lt_success INDEX 1 INTO DATA(wa_success).
+                  lv_invoice_id = wa_success-bill_doc.
+                  lv_out_status = 'S'.
+                  lv_out_msg    = 'Factura generada correctamente.'.
+              ELSE.
+                  LOOP AT lt_return INTO DATA(wa_return) WHERE type = 'E' OR type = 'A'.
+                      IF lv_out_msg IS INITIAL. lv_out_msg = wa_return-message.
+                      ELSE. CONCATENATE lv_out_msg wa_return-message INTO lv_out_msg SEPARATED BY ' / '. ENDIF.
+                  ENDLOOP.
+                  IF lv_out_msg IS INITIAL. lv_out_msg = 'Error desconocido al crear la factura.'. ENDIF.
+              ENDIF.
+          ENDIF.
+      ENDIF.
+    CATCH cx_root INTO lo_exc.
+      lv_out_msg = lo_exc->get_text( ).
+  ENDTRY.
+
+  " 3) Mover archivo a procesados en el PC local
+  DATA(lv_timestamp) = |{ sy-datum }{ sy-uzeit }|.
+  SPLIT ls_file_info-filename AT '.' INTO DATA(lv_name) DATA(lv_ext).
+  CONCATENATE lv_name '_' lv_timestamp '.' lv_ext INTO DATA(lv_new_fname).
+  CONCATENATE lc_processed_dir '\' lv_new_fname INTO DATA(lv_dest_file).
+
+  CALL METHOD cl_gui_frontend_services=>file_copy
+    EXPORTING
+      source      = lv_in_file
+      destination = lv_dest_file
+    EXCEPTIONS
+      OTHERS      = 1.
+
+  IF sy-subrc = 0.
+    CALL METHOD cl_gui_frontend_services=>file_delete
+      EXPORTING
+        filename      = lv_in_file
+      CHANGING
+        rc            = lv_delete_rc
+      EXCEPTIONS
+        OTHERS        = 1.
+  ENDIF.
+
+  " 6) Generar CSV de resultado en el PC local
+  DATA(lv_final) = |{ lv_order_id };{ lv_invoice_id };{ lv_out_status };{ lv_out_msg }|.
+  APPEND lv_final TO lt_out.
+  CONCATENATE p_out '\' lv_order_id '_invoice_result.csv' INTO lv_out_file.
+
+  CALL METHOD cl_gui_frontend_services=>gui_download
+    EXPORTING
+      filename = lv_out_file
+    CHANGING
+      data_tab = lt_out
+    EXCEPTIONS
+      OTHERS   = 1.
+
+  WAIT UP TO 10 SECONDS.
+
+ENDWHILE.
